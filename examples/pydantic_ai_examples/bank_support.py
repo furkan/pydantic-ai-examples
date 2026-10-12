@@ -2,13 +2,14 @@
 
 Run with:
 
-    just run_example bank_support model=deepseek/deepseek-v4.1-flash
+    just run_example bank_support
 """
 
 import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 import mlflow
 from pydantic import BaseModel
@@ -58,7 +59,7 @@ class SupportOutput(BaseModel):
 
 
 support_agent = Agent(
-    os.getenv("PYDANTIC_AI_MODEL", "openrouter:deepseek/deepseek-v4.1-flash"),
+    os.getenv("PYDANTIC_AI_MODEL"),
     deps_type=SupportDependencies,
     output_type=SupportOutput,
     instructions=(
@@ -86,7 +87,12 @@ async def customer_balance(ctx: RunContext[SupportDependencies]) -> str:
 
 
 if __name__ == "__main__":
-    with sqlite3.connect(":memory:") as con:
+    session_id = str(uuid4())
+
+    with (
+        sqlite3.connect(":memory:") as con,
+        mlflow.tracing.context(session_id=session_id),
+    ):
         cur = con.cursor()
         cur.execute("CREATE TABLE customers(id, name, balance)")
         cur.execute("""

@@ -1,2 +1,2 @@
-run_example example model="deepseek/deepseek-v4.1-flash":
-    model={{ quote(model) }}; PYDANTIC_AI_MODEL="openrouter:${model#model=}" uv run --env-file .env {{ quote("examples/pydantic_ai_examples/" + example + ".py") }}
+run_example example model="openai/gpt-6-luna":
+    model={{ quote(model) }}; PYDANTIC_AI_MODEL="openrouter:${model#model=}" PYTHONPATH=examples uv run --env-file .env -m pydantic_ai_examples.{{example}}

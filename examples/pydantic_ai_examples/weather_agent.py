@@ -12,19 +12,24 @@ Run with:
 from __future__ import annotations as _annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-import logfire
+os.environ["MLFLOW_TRACE_PROPAGATE_TO_OTEL_CONTEXT"] = "true"
+
+import mlflow
 from httpx import AsyncClient
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from pydantic import BaseModel
-
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import Caching
 
-# 'if-token-present' means nothing will be sent (and the example will work) if you don't have logfire configured
-logfire.configure(send_to_logfire='if-token-present')
-logfire.instrument_pydantic_ai()
+mlflow.set_tracking_uri("http://127.0.0.1:5050")
+mlflow.set_experiment(Path(__file__).stem)
+mlflow.pydantic_ai.autolog()
 
 
 @dataclass
@@ -33,10 +38,10 @@ class Deps:
 
 
 weather_agent = Agent(
-    'openai:gpt-5-mini',
+    os.getenv("PYDANTIC_AI_MODEL", "openrouter:openai/gpt-6-luna"),
     # 'Be concise, reply with one sentence.' is enough for some models (like openai) to use
     # the below tools appropriately, but others like anthropic and gemini require a bit more direction.
-    instructions='Be concise, reply with one sentence.',
+    instructions="Be concise, reply with one sentence.",
     deps_type=Deps,
     retries=2,
     capabilities=[Caching()],
@@ -58,8 +63,8 @@ async def get_lat_lng(ctx: RunContext[Deps], location_description: str) -> LatLn
     """
     # NOTE: the response here will be random, and is not related to the location description.
     r = await ctx.deps.client.get(
-        'https://demo-endpoints.pydantic.workers.dev/latlng',
-        params={'location': location_description},
+        "https://demo-endpoints.pydantic.workers.dev/latlng",
+        params={"location": location_description},
     )
     r.raise_for_status()
     return LatLng.model_validate_json(r.content)
@@ -77,31 +82,37 @@ async def get_weather(ctx: RunContext[Deps], lat: float, lng: float) -> dict[str
     # NOTE: the responses here will be random, and are not related to the lat and lng.
     temp_response, descr_response = await asyncio.gather(
         ctx.deps.client.get(
-            'https://demo-endpoints.pydantic.workers.dev/number',
-            params={'min': 10, 'max': 30},
+            "https://demo-endpoints.pydantic.workers.dev/number",
+            params={"min": 10, "max": 30},
         ),
         ctx.deps.client.get(
-            'https://demo-endpoints.pydantic.workers.dev/weather',
-            params={'lat': lat, 'lng': lng},
+            "https://demo-endpoints.pydantic.workers.dev/weather",
+            params={"lat": lat, "lng": lng},
         ),
     )
     temp_response.raise_for_status()
     descr_response.raise_for_status()
     return {
-        'temperature': f'{temp_response.text} °C',
-        'description': descr_response.text,
+        "temperature": f"{temp_response.text} °C",
+        "description": descr_response.text,
     }
 
 
 async def main():
     async with AsyncClient() as client:
-        logfire.instrument_httpx(client, capture_all=True)
+        HTTPXClientInstrumentor.instrument_client(
+            client,
+            tracer_provider=mlflow.tracing.get_bridged_tracer_provider(),
+        )
         deps = Deps(client=client)
         result = await weather_agent.run(
-            'What is the weather like in London and in Wiltshire?', deps=deps
+            "What is the weather like in London and in Wiltshire?", deps=deps
         )
-        print('Response:', result.output)
+        print("Response:", result.output)
 
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__ == "__main__":
+    session_id = str(uuid4())
+
+    with mlflow.tracing.context(session_id=session_id):
+        asyncio.run(main())

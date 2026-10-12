@@ -6,16 +6,17 @@ Run with:
 """
 
 import os
+from pathlib import Path
+from uuid import uuid4
 
-import logfire
+import mlflow
 from pydantic import BaseModel
-
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Caching
 
-# 'if-token-present' means nothing will be sent (and the example will work) if you don't have logfire configured
-logfire.configure(send_to_logfire='if-token-present')
-logfire.instrument_pydantic_ai()
+mlflow.set_tracking_uri("http://127.0.0.1:5050")
+mlflow.set_experiment(Path(__file__).stem)
+mlflow.pydantic_ai.autolog()
 
 
 class MyModel(BaseModel):
@@ -23,11 +24,14 @@ class MyModel(BaseModel):
     country: str
 
 
-model = os.getenv('PYDANTIC_AI_MODEL', 'openai:gpt-5.2')
-print(f'Using model: {model}')
+model = os.getenv("PYDANTIC_AI_MODEL", "openai:gpt-5.2")
+print(f"Using model: {model}")
 agent = Agent(model, output_type=MyModel, capabilities=[Caching()])
 
-if __name__ == '__main__':
-    result = agent.run_sync('The windy city in the US of A.')
-    print(result.output)
-    print(result.usage)
+if __name__ == "__main__":
+    session_id = str(uuid4())
+
+    with mlflow.tracing.context(session_id=session_id):
+        result = agent.run_sync("The windy city in the US of A.")
+        print(result.output)
+        print(result.usage)
