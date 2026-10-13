@@ -9,22 +9,27 @@ from __future__ import annotations as _annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 from collections.abc import AsyncGenerator, Callable
 from concurrent.futures.thread import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal, LiteralString, TypeVar
 
+os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = "false"
+
 import fastapi
-import logfire
+import mlflow
 from fastapi import Depends, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from typing_extensions import ParamSpec, TypedDict
-
+from mlflow.entities.trace_location import MlflowExperimentLocation
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor
 from pydantic_ai import (
     Agent,
     ModelMessage,
@@ -36,53 +41,59 @@ from pydantic_ai import (
     UserPromptPart,
 )
 from pydantic_ai.capabilities import Caching
+from typing_extensions import ParamSpec, TypedDict
 
-# 'if-token-present' means nothing will be sent (and the example will work) if you don't have logfire configured
-logfire.configure(send_to_logfire='if-token-present')
-logfire.instrument_pydantic_ai()
+mlflow.set_tracking_uri("http://127.0.0.1:5050")
+experiment_id = mlflow.set_experiment(Path(__file__).stem).experiment_id
+mlflow.tracing.set_destination(MlflowExperimentLocation(experiment_id))
+mlflow.pydantic_ai.autolog()
 
-agent = Agent('openai:gpt-5.2', capabilities=[Caching()])
+agent = Agent(os.getenv("PYDANTIC_AI_MODEL"), capabilities=[Caching()])
 THIS_DIR = Path(__file__).parent
 
 
 @asynccontextmanager
 async def lifespan(_app: fastapi.FastAPI):
     async with Database.connect() as db:
-        yield {'db': db}
+        yield {"db": db}
 
 
 app = fastapi.FastAPI(lifespan=lifespan)
-logfire.instrument_fastapi(app)
+FastAPIInstrumentor.instrument_app(
+    app,
+    tracer_provider=mlflow.tracing.get_bridged_tracer_provider(),
+    exclude_spans=["receive", "send"],
+)
 
 
-@app.get('/')
+@app.get("/")
 async def index() -> FileResponse:
-    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+    return FileResponse((THIS_DIR / "chat_app.html"), media_type="text/html")
 
 
-@app.get('/chat_app.ts')
+@app.get("/chat_app.ts")
 async def main_ts() -> FileResponse:
     """Get the raw typescript code, it's compiled in the browser, forgive me."""
-    return FileResponse((THIS_DIR / 'chat_app.ts'), media_type='text/plain')
+    return FileResponse((THIS_DIR / "chat_app.ts"), media_type="text/plain")
 
 
 async def get_db(request: Request) -> Database:
     return request.state.db
 
 
-@app.get('/chat/')
+@app.get("/chat/")
 async def get_chat(database: Database = Depends(get_db)) -> Response:
     msgs = await database.get_messages()
     return Response(
-        b'\n'.join(json.dumps(to_chat_message(m)).encode('utf-8') for m in msgs),
-        media_type='text/plain',
+        b"\n".join(json.dumps(to_chat_message(m)).encode("utf-8") for m in msgs),
+        media_type="text/plain",
     )
 
 
 class ChatMessage(TypedDict):
     """Format of messages sent to the browser."""
 
-    role: Literal['user', 'model']
+    role: Literal["user", "model"]
     timestamp: str
     content: str
 
@@ -93,21 +104,20 @@ def to_chat_message(m: ModelMessage) -> ChatMessage:
         if isinstance(first_part, UserPromptPart):
             assert isinstance(first_part.content, str)
             return {
-                'role': 'user',
-                'timestamp': first_part.timestamp.isoformat(),
-                'content': first_part.content,
+                "role": "user",
+                "timestamp": first_part.timestamp.isoformat(),
+                "content": first_part.content,
             }
-    elif isinstance(m, ModelResponse):
-        if isinstance(first_part, TextPart):
-            return {
-                'role': 'model',
-                'timestamp': m.timestamp.isoformat(),
-                'content': first_part.content,
-            }
-    raise UnexpectedModelBehavior(f'Unexpected message type for chat app: {m}')
+    elif isinstance(m, ModelResponse) and isinstance(first_part, TextPart):
+        return {
+            "role": "model",
+            "timestamp": m.timestamp.isoformat(),
+            "content": first_part.content,
+        }
+    raise UnexpectedModelBehavior(f"Unexpected message type for chat app: {m}")
 
 
-@app.post('/chat/')
+@app.post("/chat/")
 async def post_chat(
     prompt: Annotated[str, fastapi.Form()], database: Database = Depends(get_db)
 ) -> StreamingResponse:
@@ -117,12 +127,12 @@ async def post_chat(
         yield (
             json.dumps(
                 {
-                    'role': 'user',
-                    'timestamp': datetime.now(tz=UTC).isoformat(),
-                    'content': prompt,
+                    "role": "user",
+                    "timestamp": datetime.now(tz=UTC).isoformat(),
+                    "content": prompt,
                 }
-            ).encode('utf-8')
-            + b'\n'
+            ).encode("utf-8")
+            + b"\n"
         )
         # get the chat history so far to pass as context to the agent
         messages = await database.get_messages()
@@ -132,16 +142,16 @@ async def post_chat(
                 # text here is a `str` and the frontend wants
                 # JSON encoded ModelResponse, so we create one
                 m = ModelResponse(parts=[TextPart(text)], timestamp=result.timestamp)
-                yield json.dumps(to_chat_message(m)).encode('utf-8') + b'\n'
+                yield json.dumps(to_chat_message(m)).encode("utf-8") + b"\n"
 
         # add new messages (e.g. the user prompt and the agent response in this case) to the database
         await database.add_messages(result.new_messages_json())
 
-    return StreamingResponse(stream_messages(), media_type='text/plain')
+    return StreamingResponse(stream_messages(), media_type="text/plain")
 
 
-P = ParamSpec('P')
-R = TypeVar('R')
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 @dataclass
@@ -159,9 +169,9 @@ class Database:
     @classmethod
     @asynccontextmanager
     async def connect(
-        cls, file: Path = THIS_DIR / '.chat_app_messages.sqlite'
+        cls, file: Path = THIS_DIR / ".chat_app_messages.sqlite"
     ) -> AsyncGenerator[Database]:
-        with logfire.span('connect to DB'):
+        with mlflow.start_span("connect to DB"):
             loop = asyncio.get_running_loop()
             executor = ThreadPoolExecutor(max_workers=1)
             con = await loop.run_in_executor(executor, cls._connect, file)
@@ -174,10 +184,13 @@ class Database:
     @staticmethod
     def _connect(file: Path) -> sqlite3.Connection:
         con = sqlite3.connect(str(file))
-        con = logfire.instrument_sqlite3(con)
+        con = SQLite3Instrumentor.instrument_connection(
+            con,
+            tracer_provider=mlflow.tracing.get_bridged_tracer_provider(),
+        )
         cur = con.cursor()
         cur.execute(
-            'CREATE TABLE IF NOT EXISTS messages (id INT PRIMARY KEY, message_list TEXT);'
+            "CREATE TABLE IF NOT EXISTS messages (id INT PRIMARY KEY, message_list TEXT);"
         )
         con.commit()
         return con
@@ -185,7 +198,7 @@ class Database:
     async def add_messages(self, messages: bytes):
         await self._asyncify(
             self._execute,
-            'INSERT INTO messages (message_list) VALUES (?);',
+            "INSERT INTO messages (message_list) VALUES (?);",
             messages,
             commit=True,
         )
@@ -193,7 +206,7 @@ class Database:
 
     async def get_messages(self) -> list[ModelMessage]:
         c = await self._asyncify(
-            self._execute, 'SELECT message_list FROM messages order by id'
+            self._execute, "SELECT message_list FROM messages order by id"
         )
         rows = await self._asyncify(c.fetchall)
         messages: list[ModelMessage] = []
@@ -213,16 +226,18 @@ class Database:
     async def _asyncify(
         self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
     ) -> R:
-        return await self._loop.run_in_executor(  # pyright: ignore[reportUnknownVariableType]
+        ctx = copy_context()
+
+        return await self._loop.run_in_executor(
             self._executor,
-            partial(func, **kwargs),
-            *args,  # pyright: ignore[reportCallIssue]
+            ctx.run,
+            partial(func, *args, **kwargs),
         )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        'pydantic_ai_examples.chat_app:app', reload=True, reload_dirs=[str(THIS_DIR)]
+        "pydantic_ai_examples.chat_app:app", reload=True, reload_dirs=[str(THIS_DIR)]
     )

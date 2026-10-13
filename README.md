@@ -1,6 +1,6 @@
 # pydantic-ai-examples
 
-pydantic ai examples, further opiniated with openrouter and mlflow integrations
+pydantic ai examples, further opinionated with openrouter and mlflow integrations
 
 ---
 
